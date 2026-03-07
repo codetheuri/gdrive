@@ -341,7 +341,7 @@ do_manual_sync() {
     press_enter; return
   fi
 
-  /usr/local/bin/sync_to_gdrive.sh $EXEC_LINE --interval 0 2>&1 | tail -20 && ok "Manual sync complete" || err "Sync encountered errors — see $LOG_FILE"
+  eval /usr/local/bin/sync_to_gdrive.sh $EXEC_LINE --interval 0 2>&1 | tail -20 && ok "Manual sync complete" || err "Sync encountered errors — see $LOG_FILE"
   press_enter
 }
 
