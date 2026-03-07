@@ -321,20 +321,35 @@ sync_folder() {
   local LOCAL="$1" REMOTE="$2"
   log "Syncing $LOCAL → $REMOTE"
   
+  local OUTPUT
   if [ "$DELETE" = true ]; then
     log "WARNING: delete mode active (mirroring) for $REMOTE"
     # use rclone sync
-    if "$RCLONE" sync "$LOCAL" "$REMOTE" --config "$CONFIG_FILE" -v >> "$LOG_FILE" 2>&1; then
+    if OUTPUT=$("$RCLONE" sync "$LOCAL" "$REMOTE" --config "$CONFIG_FILE" -v 2>&1); then
+      echo "$OUTPUT" >> "$LOG_FILE"
       log "✔ Sync done: $LOCAL → $REMOTE"
     else
+      echo "$OUTPUT" >> "$LOG_FILE"
       log "✘ Sync failed: $LOCAL → $REMOTE"
+      echo "$OUTPUT" | grep "ERROR :" | while IFS= read -r line; do
+        local FAILED_MSG
+        FAILED_MSG=$(echo "$line" | sed 's/.*ERROR : //')
+        log "  - Failed: $FAILED_MSG"
+      done
     fi
   else
     # use rclone copy (safe mode)
-    if "$RCLONE" copy "$LOCAL" "$REMOTE" --config "$CONFIG_FILE" -v >> "$LOG_FILE" 2>&1; then
+    if OUTPUT=$("$RCLONE" copy "$LOCAL" "$REMOTE" --config "$CONFIG_FILE" -v 2>&1); then
+      echo "$OUTPUT" >> "$LOG_FILE"
       log "✔ Copy done: $LOCAL → $REMOTE"
     else
+      echo "$OUTPUT" >> "$LOG_FILE"
       log "✘ Copy failed: $LOCAL → $REMOTE"
+      echo "$OUTPUT" | grep "ERROR :" | while IFS= read -r line; do
+        local FAILED_MSG
+        FAILED_MSG=$(echo "$line" | sed 's/.*ERROR : //')
+        log "  - Failed: $FAILED_MSG"
+      done
     fi
   fi
 }
@@ -364,8 +379,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=www-data
-Group=www-data
+User=root
+Group=root
 WorkingDirectory=/var/www
 ExecStart=/usr/local/bin/$SCRIPT_NAME $EXEC_ARGS
 Restart=always
