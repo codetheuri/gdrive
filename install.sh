@@ -118,20 +118,41 @@ fi
 step "Google Drive Authentication"
 echo ""
 echo -e "  To bypass Google's 0-byte upload limit, we authenticate directly with your Google account."
-echo -e "  Please follow these 3 steps on your ${BOLD}personal computer (Windows/Mac)${RESET}:"
-echo -e "    1. Download rclone: ${CYAN}https://rclone.org/downloads/${RESET}"
-echo -e "    2. Extract it, open a terminal/command prompt there, and run: ${BOLD}rclone authorize \"drive\"${RESET}"
-echo -e "    3. After your browser login, copy the secret code starting with ${GREEN}{\"access_token\":...}${RESET}"
+echo -e "  Because this server has no web browser, follow these steps:"
 echo ""
-echo -e "  ${WHITE}${BOLD}Paste that entire JSON block below and press Enter:${RESET}"
-echo -ne "  ${GREEN}›${RESET} "
-read -r USER_TOKEN
+echo -e "  ${CYAN}${BOLD}1. Copy the link that appears below, paste it in your computer's browser, and log in.${RESET}"
+echo -e "  ${CYAN}${BOLD}2. Google will give you a block of code (starts with 4/xx...). Paste it back here.${RESET}"
+echo ""
 
-if [[ ! "$USER_TOKEN" =~ ^\{.*\}$ ]]; then
-  err "Invalid token. It must be a complete JSON block starting with { and ending with }"
+# Run rclone headlessly. We start an interactive screen or simply launch it.
+# We will use 'script' to capture the URL from stderr/stdout without breaking interactive input
+mkdir -p /tmp/rclone_auth
+rm -f /tmp/rclone_auth/auth.log
+
+echo -e "  ${DIM}Starting rclone headless authentication...${RESET}"
+echo -e "  ${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+# We temporarily use the www-data config folder so rclone can read/write without root issues
+RCLONE_CONFIG_DIR="/var/www/.config/rclone"
+mkdir -p "$RCLONE_CONFIG_DIR"
+chown -R www-data:www-data /var/www/.config
+
+# Run rclone config as the target user. We create a temporary config to harvest the token.
+sudo -u www-data rclone config create gdrive drive config_is_local=false
+
+# Wait for rclone to finish, then we will extract the token from the newly generated conf
+TMP_RCLONE_CONF="$RCLONE_CONFIG_DIR/rclone.conf"
+if ! grep -q "token =" "$TMP_RCLONE_CONF" 2>/dev/null; then
+  err "Authentication failed or cancelled."
   exit 1
 fi
-ok "Token accepted"
+
+echo -e "  ${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+echo ""
+
+# Extract the token directly from rclone's generated file
+USER_TOKEN=$(grep -oP 'token = \K.*' "$TMP_RCLONE_CONF")
+
+ok "Token successfully generated!"
 
 mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$INSTALL_DIR"
 
