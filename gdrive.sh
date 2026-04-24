@@ -75,12 +75,25 @@ service_enabled_color() {
 # ── Parse sync pairs from service file ───────────────────────────────────────
 get_sync_pairs() {
   if [ ! -f "$SERVICE_FILE" ]; then echo ""; return; fi
-  # Parses `--local-path "X" --remote-path "Y"`
-  grep -oP '(?<=--local-path ")[^"]+' "$SERVICE_FILE" > /tmp/locals.txt || true
-  grep -oP '(?<=--remote-path ")[^"]+' "$SERVICE_FILE" > /tmp/remotes.txt || true
-  if [ -s /tmp/locals.txt ] && [ -s /tmp/remotes.txt ]; then
-    paste /tmp/locals.txt /tmp/remotes.txt -d':'
-  fi
+  python3 - "$SERVICE_FILE" << 'PYEOF'
+import re, sys
+
+content = open(sys.argv[1]).read()
+match = re.search(r'^ExecStart=(.+)$', content, re.MULTILINE)
+if not match:
+    sys.exit(0)
+
+line = match.group(1)
+# Split into per-pair segments by splitting just before each --local-path
+segments = re.split(r'(?=\s--local-path\s)', line)
+for seg in segments:
+    lm = re.search(r'--local-path "([^"]+)"', seg)
+    rm = re.search(r'--remote-path "([^"]+)"', seg)
+    mm = re.search(r'--pair-mode "([^"]+)"', seg)
+    if lm and rm:
+        mode = mm.group(1) if mm else "copy"
+        print(f"{lm.group(1)}|{rm.group(1)}|{mode}")
+PYEOF
 }
 
 get_exec_start() {
@@ -112,11 +125,15 @@ show_dashboard() {
     echo -e "    ${DIM}No sync pairs configured.${RESET}"
   else
     while IFS= read -r pair; do
-      local_path="${pair%%:*}"
-      remote_path="${pair#*:}"
+      local_path="${pair%%|*}"
+      rest="${pair#*|}"
+      remote_path="${rest%|*}"
+      mode="${rest##*|}"
       STATUS_ICON="${GREEN}✔${RESET}"
       [ ! -d "$local_path" ] && STATUS_ICON="${YELLOW}?${RESET}"
-      echo -e "    $STATUS_ICON ${CYAN}$local_path${RESET}  →  ${MAGENTA}$remote_path${RESET}"
+      MODE_TAG="${DIM}[copy]${RESET}"
+      [ "$mode" = "mirror" ] && MODE_TAG="${YELLOW}[mirror]${RESET}"
+      echo -e "    $STATUS_ICON ${CYAN}$local_path${RESET}  →  ${MAGENTA}$remote_path${RESET}  $MODE_TAG"
     done <<< "$PAIRS"
   fi
   echo ""
@@ -273,10 +290,25 @@ do_add_pair() {
 
   ok "Adding pair: ${CYAN}$NEW_LOCAL${RESET}  →  ${MAGENTA}$NEW_REMOTE${RESET}"
 
-  # Append to ExecStart in service file (quoted)
+  # Ask about sync mode
+  echo ""
+  echo -e "  ${BOLD}Sync mode:${RESET}"
+  echo -e "    ${CYAN}[c]${RESET}  Copy   ${DIM}(safe — only adds/updates, never deletes from Drive)${RESET}"
+  echo -e "    ${YELLOW}[m]${RESET}  Mirror ${DIM}(exact mirror — deletes from Drive if deleted locally)${RESET}"
+  echo -ne "  ${GREEN}›${RESET} [c/m, default c]: "
+  read -r mode_choice
+  NEW_MODE="copy"
+  [[ "${mode_choice,,}" == "m" ]] && NEW_MODE="mirror"
+
+  # Append to ExecStart in service file — use python3 to avoid sed special-char corruption
   CURRENT_EXEC=$(get_exec_start)
-  NEW_EXEC="$CURRENT_EXEC --local-path \"$NEW_LOCAL\" --remote-path \"$NEW_REMOTE\""
-  sed -i "s|^ExecStart=.*|ExecStart=$NEW_EXEC|" "$SERVICE_FILE"
+  NEW_EXEC="$CURRENT_EXEC --local-path \"$NEW_LOCAL\" --remote-path \"$NEW_REMOTE\" --pair-mode \"$NEW_MODE\""
+  python3 -c "
+import re, sys
+content = open('$SERVICE_FILE').read()
+content = re.sub(r'^ExecStart=.*', 'ExecStart=$NEW_EXEC', content, flags=re.MULTILINE)
+open('$SERVICE_FILE', 'w').write(content)
+"
 
   systemctl daemon-reload
   ok "Service file updated. Restart to apply changes."
@@ -297,9 +329,13 @@ do_remove_pair() {
 
   mapfile -t PAIR_ARRAY <<< "$PAIRS"
   for i in "${!PAIR_ARRAY[@]}"; do
-    local_p="${PAIR_ARRAY[$i]%%:*}"
-    remote_p="${PAIR_ARRAY[$i]#*:}"
-    echo -e "    ${DIM}[$((i+1))]${RESET}  ${CYAN}$local_p${RESET}  →  ${MAGENTA}$remote_p${RESET}"
+    local_p="${PAIR_ARRAY[$i]%%|*}"
+    rest_p="${PAIR_ARRAY[$i]#*|}"
+    remote_p="${rest_p%|*}"
+    mode_p="${rest_p##*|}"
+    MODE_TAG="${DIM}[copy]${RESET}"
+    [ "$mode_p" = "mirror" ] && MODE_TAG="${YELLOW}[mirror]${RESET}"
+    echo -e "    ${DIM}[$((i+1))]${RESET}  ${CYAN}$local_p${RESET}  →  ${MAGENTA}$remote_p${RESET}  $MODE_TAG"
   done
   echo ""
   echo -ne "  Select pair to remove (number):\n  ${GREEN}›${RESET} "
@@ -307,12 +343,31 @@ do_remove_pair() {
 
   if [[ "$IDX" =~ ^[0-9]+$ ]] && [ "$IDX" -ge 1 ] && [ "$IDX" -le "${#PAIR_ARRAY[@]}" ]; then
     REMOVE_PAIR="${PAIR_ARRAY[$((IDX-1))]}"
-    RM_LOCAL="${REMOVE_PAIR%%:*}"
-    RM_REMOTE="${REMOVE_PAIR#*:}"
+    RM_LOCAL="${REMOVE_PAIR%%|*}"
+    RM_REST="${REMOVE_PAIR#*|}"
+    RM_REMOTE="${RM_REST%|*}"
+    RM_MODE="${RM_REST##*|}"
 
     CURRENT_EXEC=$(get_exec_start)
-    NEW_EXEC=$(echo "$CURRENT_EXEC" | sed "s| --local-path \"$RM_LOCAL\" --remote-path \"$RM_REMOTE\"||g")
-    sed -i "s|^ExecStart=.*|ExecStart=$NEW_EXEC|" "$SERVICE_FILE"
+    NEW_EXEC=$(echo "$CURRENT_EXEC" | python3 -c "
+import sys
+line = sys.stdin.read()
+# Try removing with --pair-mode first, then fall back (backward compat)
+for mode in ['$RM_MODE', 'copy', 'mirror']:
+    candidate = line.replace(' --local-path \"$RM_LOCAL\" --remote-path \"$RM_REMOTE\" --pair-mode \"' + mode + '\"', '')
+    if candidate != line:
+        line = candidate
+        break
+# Fallback: remove without --pair-mode
+line = line.replace(' --local-path \"$RM_LOCAL\" --remote-path \"$RM_REMOTE\"', '')
+print(line, end='')
+")
+    python3 -c "
+import re
+content = open('$SERVICE_FILE').read()
+content = re.sub(r'^ExecStart=.*', 'ExecStart=' + r'''$NEW_EXEC''', content, flags=re.MULTILINE)
+open('$SERVICE_FILE', 'w').write(content)
+"
 
     systemctl daemon-reload
     ok "Removed: ${CYAN}$RM_LOCAL${RESET}  →  ${MAGENTA}$RM_REMOTE${RESET}"
@@ -327,7 +382,9 @@ do_remove_pair() {
 
 do_manual_sync() {
   echo ""
-  echo -e "  ${DIM}Running one-off sync for all pairs...${RESET}\n"
+  echo -e "  ${DIM}Running one-off sync for all pairs...${RESET}"
+  echo -e "  ${DIM}Streaming live log output below — press ${BOLD}Ctrl+C${RESET}${DIM} to cancel${RESET}\n"
+  divider
 
   EXEC_LINE=$(get_exec_start | sed 's|--interval [0-9]*||g' | sed 's|/usr/local/bin/sync_to_gdrive.sh||')
   if [ -z "$EXEC_LINE" ]; then
@@ -341,7 +398,28 @@ do_manual_sync() {
     press_enter; return
   fi
 
-  eval /usr/local/bin/sync_to_gdrive.sh $EXEC_LINE --interval 0 2>&1 | tail -20 && ok "Manual sync complete" || err "Sync encountered errors — see $LOG_FILE"
+  # Run sync in background, stream the log file live while it runs
+  eval /usr/local/bin/sync_to_gdrive.sh $EXEC_LINE --interval 0 &
+  SYNC_PID=$!
+
+  # Tail the log live; stop when sync finishes
+  tail -n 0 -f "$LOG_FILE" &
+  TAIL_PID=$!
+
+  # Handle Ctrl+C gracefully
+  trap 'kill $SYNC_PID $TAIL_PID 2>/dev/null; trap - INT; echo ""; warn "Sync cancelled."; press_enter; return' INT
+
+  wait $SYNC_PID
+  SYNC_EXIT=$?
+  kill $TAIL_PID 2>/dev/null
+  trap - INT
+
+  divider
+  if [ $SYNC_EXIT -eq 0 ]; then
+    ok "Manual sync complete"
+  else
+    err "Sync encountered errors — check logs above or view [4] Live logs"
+  fi
   press_enter
 }
 
